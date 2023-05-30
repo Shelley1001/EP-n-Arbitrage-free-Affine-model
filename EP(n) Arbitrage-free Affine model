@@ -1,0 +1,238 @@
+library(readxl)
+library(expm)
+library(numDeriv)
+
+graphics.off()  
+rm(list = ls()) 
+
+# read excel spot data
+df.spot <- read_excel("path to file ")
+#degree of polynom
+n <- 1
+# divide date and data
+dt <- 1/12 #1/52 # weekly
+nf <- n+2
+v.ymd  <- df.spot[,1]
+m.spot <- as.matrix(df.spot[,-1])
+v.mat  <- seq(from = 1, to = 15, by = 1) #maturity range
+nmat <- length(v.mat) # # of maturities
+
+#Initial parameters
+vT<-v.mat
+t <- 0
+
+init_para_un <- c(
+  1,1,1,#kappa
+  1, 
+  0,1,
+  0,0,1,# sigma
+  0,  0, 0,# theta
+  -0.3868475138,          # lambda
+  rep(0.000524,nmat)               # measurement error
+)
+# EPM factor loading matrix
+EPM.B <- function(lambda, t, vT, n)
+{
+  col1 <- rep.int(1, length(vT))
+  v <- cbind(col1)
+  for (i in 0:n) {
+    if (i == 0) {
+      col1 <- ((1 - exp(-lambda * (vT - t))) / (lambda * (vT - t)))
+      v <- cbind(v, col1)
+    }
+    if (i != 0) {
+      col1 <- (i) * col1 -
+        ((((
+          lambda * (vT - t)
+        ) ^ (i)) / (lambda * (vT - t)) * exp(-lambda * (vT - t))))
+      v <- cbind(v, col1)
+    }
+  }
+  return(v)
+}
+
+# yield adjustment term in AFNS
+AFNS.EPM.C<-function(sigma, lambda, t, v.mat, n){
+  timeArray<-array()
+  for (m in 1:length(vT)) {
+    EPM.B.Matrix <- matrix(nrow = (nf), ncol = (nf))
+    trianMat<-lower.tri(EPM.B.Matrix, diag = TRUE)
+    for (k in 1:(nf)) {
+      for (l in 1:(nf)) {
+        EPM.B <- function(s) {
+          arrayB <- array()
+          element <- -(vT[m] - s)
+          arrayB <- c(element)
+          for (i in 0:n) {
+            if (i == 0) {
+              col1 <- ((1 - exp(-lambda * (vT[m] - s))) / (lambda * (vT[m] - s)))
+              element <- -(vT[m] - s) * col1
+              arrayB <- append(arrayB, element)
+            }
+            if (i != 0) {
+              col1 <- (i) * col1 -
+                ((((
+                  lambda * (vT[m] - s)
+                ) ^ (i)) / (lambda * (vT[m] - s)) * exp(-lambda * (vT[m] - s))))
+              element <- -(vT[m] - s) * col1
+              arrayB <- append(arrayB, element)
+            }
+          }
+          if(trianMat[k,l]==TRUE){
+            product <- (arrayB[k] * arrayB[l])
+            return((product))
+          }
+        }
+        if((trianMat[k,l])==TRUE &&(k==l)){
+          EPM.B.Matrix[k, l] <-
+            -(1 / 2) * 1 / (vT[m] - t) * integrate(Vectorize(EPM.B), lower = t, upper =
+                                                     vT[m])$value
+        } else if((trianMat[k,l]==TRUE) &&(k!=l)){
+          EPM.B.Matrix[k, l] <- -1 / (vT[m] - t) * integrate(Vectorize(EPM.B), lower = t, upper =
+                                                               vT[m])$value
+        }
+      }
+    }
+    finalSum<-0
+    mat <- matrix(nrow = (nf), ncol = (nf))
+    diag<-c(diag(EPM.B.Matrix))
+    sumProductRow<-c()
+    squareSumRows<-rowSums((sigma)^2)
+    trianMat<-lower.tri(mat, diag = FALSE)
+    # diagonal elements
+    finalSum<-finalSum+crossprod(diag, squareSumRows)
+    # non-diagonal elements
+    EPM.B.Array<-c()
+    for (i in 1:(nf)) {
+      for (j in 1:(nf)) {
+        if(i!=j){
+          if(trianMat[j,i]==TRUE){
+            sumProductRow<-c(sumProductRow,
+                             sigma[i,] %*% sigma[j,])
+            EPM.B.Array<-c(EPM.B.Array, EPM.B.Matrix[j,i] )
+          }
+        }
+      }
+    }
+    finalSum<-finalSum+crossprod(EPM.B.Array, sumProductRow)
+    timeArray<-append(timeArray,finalSum)
+  }
+  timeArray <- timeArray[!is.na(timeArray)]
+  return(timeArray)
+} 
+nmat <- length(v.mat) # lenght of maturities
+nobs <- nrow(m.spot)  # lenght of observations
+gm.factor <- matrix(0,nobs,nf)
+npara <- length(init_para_un) # lenght of parameters
+
+# parameter restrictions
+trans<-function(b)
+{
+  bb <- b
+  bb[1]  <- 1/(1+exp(b[1]))  # kappa11
+  bb[13]<-bb[13]^2          # lambda
+  bb[14:npara]<- bb[14:npara]^2          # measurement error
+  return(bb)
+}
+
+# log likelihood function
+loglike<-function(para_un,m.spot)
+{
+  para <- trans(para_un)
+  # restricted parameters
+  kappa  <- diag(para[1:3])
+  sigma<- rbind(c(para[4],0,0),
+                c(para[5],para[6],0),
+                c(para[7],para[8],para[9])
+  )
+  theta  <- para[10:12]
+  lambda <- para[13]
+  H      <- diag(para[14:npara])
+  B  <- EPM.B(lambda, t, v.mat, n);
+  tB <- t(B) # factor loading matrix
+  C  <- AFNS.EPM.C(sigma, lambda, t, v.mat, n)   # yield adjustment
+  # Conditional and Unconditional covariance matrix : Q, Q0
+  m    <- eigen(kappa)
+  eval <- m$values
+  evec <- m$vectors; 
+  ievec<-solve(evec)
+  Smat <- ievec%*%sigma%*%t(sigma)%*%t(ievec)
+  Vdt  <- Vinf <- matrix(0,nf,nf)
+  for(i in 1:nf) { for(j in 1:nf) {
+    Vdt[i,j] <-Smat[i,j]*(1-exp(-(eval[i]+eval[j])*dt))/
+      (eval[i]+eval[j]) # conditional
+    Vinf[i,j]<-Smat[i,j]/(eval[i]+eval[j]) # unconditional
+  }
+  }
+  # Analytical Covariance matrix
+  # Q : conditional, Q0 : unconditional
+  Q  <- evec%*%Vdt%*%t(evec)
+  Q0 <- evec%*%Vinf%*%t(evec)
+  # initialzation of vector and matrix
+  prevX <- theta; 
+  prevV <- Q0
+  Phi1  <- expm(-kappa*dt)
+  Phi0  <- (diag(nf)-Phi1)%*%theta
+  loglike <- 0 # log likelihood function
+  for(i in 1:nobs) {
+    Xhat <- Phi0+Phi1%*%prevX        # predicted state
+    Vhat <- Phi1%*%prevV%*%t(Phi1)+Q # predicted cov
+    y        <- m.spot[i,] # the observed yield
+    yimplied <- B%*%Xhat+C # the model-implied yields
+    er       <- y-yimplied # prediction error
+    # updating
+    ev <- B%*%Vhat%*%tB+H; 
+    iev<-solve(ev)
+    KG <- Vhat%*%tB%*%iev # Kalman Gain
+    prevX <- Xhat+KG%*%er       # E[X|y_t]   updated state
+    prevV <- Vhat-KG%*%B%*%Vhat # Cov[X|y_t] updated cov
+    # log likelihood function
+    loglike <- loglike - 0.5*(nmat)*log(2*pi)-
+      0.5*log(det(ev))-0.5*t(er)%*%iev%*%er
+    gm.factor[i,] <<- prevX
+  }
+  return(-loglike)
+}
+
+m<-optim(init_para_un,loglike,
+         control = list(maxit=5000, trace=2),
+         method=c("Nelder-Mead"),m.spot=m.spot)
+prev_likev <- m$value
+v.likev    <- m$value
+
+name_theta <- 
+  c("kappa_11"   , "kappa_12", "kappa_13", "kappa_14", 
+    "sigma_11"  , 
+    "sigma_21","sigma_22",
+    "sigma_31", "sigma_32","sigma_33", 
+    "sigma_41", "sigma_42","sigma_43", "sigma_44", 
+    "theta_1"   , "theta_2"   , "theta_3" , "theta_4" ,
+    "lambda"    ,  "epsilon_1" ,
+    "epsilon_2" , "epsilon_3" , "epsilon_4",
+    "epsilon_5" , "epsilon_6" , "epsilon_7",
+    "epsilon_8" , "epsilon_9" , "epsilon_10","epsilon_10",
+    "epsilon_10","epsilon_10","epsilon_10","epsilon_10")
+
+x11(width=6, height=5);
+name=c("X1", "X2","X3")
+colnames(gm.factor) <- name
+op <- par(cex = 0.5)
+matplot(gm.factor,type="l", ylab="X1, X2, X3",
+        main = "AFNS 3 Factor Estimates (X1, X2,X3)", lwd=2, col=c(1:3), lty = 1)
+legend("bottomleft", inset=0.01, legend=name, col=c(1:3),lwd=2,
+       bg= ("white"), horiz=F, lty = 1)
+# Delta method for statistical inference
+grad    <- jacobian(trans, m$par)
+hess    <- hessian(func=loglike, x=m$par,m.spot=m.spot)
+vcv_con <- grad%*%solve(hess)%*%t(grad)
+
+# parameter | std.err | t-value | p-value
+theta   <- trans(m$par)
+stderr  <- sqrt(diag(vcv_con))
+tstat   <- theta/stderr
+pvalue  <- 2*pt(-abs(tstat),df=nobs-npara)
+df.est  <- cbind(theta)
+
+rownames(df.est) <- name_theta # parameter name
+colnames(df.est) <-c("parameter")
+print(df.est)
